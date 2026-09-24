@@ -1,0 +1,10 @@
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+venv/
+bot_backup*
+squares_bot_backup*
