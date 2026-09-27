@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # НАСТРОЙКИ
 # ============================================================
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -220,6 +220,16 @@ def init_db():
             correct INTEGER NOT NULL DEFAULT 0,
             timed_out INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS support_messages (
+            admin_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (admin_id, message_id)
         )
     """)
 
@@ -1313,6 +1323,27 @@ async def all_text_handler(message: Message):
     user_id = message.from_user.id
     text = (message.text or "").strip()
 
+    if user_id in ADMIN_IDS and message.reply_to_message:
+        support = db.execute("""
+            SELECT user_id FROM support_messages
+            WHERE admin_id = ? AND message_id = ?
+        """, (user_id, message.reply_to_message.message_id)).fetchone()
+
+        if support:
+            if not text:
+                await message.answer("❌ Ответ пустой.")
+                return
+            sent = await safe_send_message(
+                support["user_id"],
+                f"✉️ Ответ администратора:\n\n{text}"
+            )
+            await message.answer(
+                "✅ Ответ отправлен пользователю."
+                if sent else
+                "❌ Не удалось отправить ответ: пользователь заблокировал бота или аккаунт недоступен."
+            )
+            return
+
     if user_id in test_sessions:
         if text in ["⚙️ Настройки", "📊 Статистика", "📚 Сегодня", "ℹ️ Помощь", "🔢 Изменить число", "⬅️ Назад"]:
             await message.answer("⚠️ Сначала закончи текущий тест.")
@@ -1770,13 +1801,25 @@ async def all_text_handler(message: Message):
             if not ADMIN_IDS:
                 await message.answer("❌ Администратор ещё не настроен.", reply_markup=settings_keyboard)
                 return
-            text_to_admin = (f"✉️ Сообщение от пользователя\n\n" f"ID: {user_id}\n" f"Имя: {message.from_user.full_name}\n" f"Username: @{message.from_user.username or 'нет'}\n\n" f"{text}")
+            text_to_admin = (
+                f"✉️ Сообщение от пользователя\n\n"
+                f"ID: {user_id}\n"
+                f"Имя: {message.from_user.full_name}\n"
+                f"Username: @{message.from_user.username or 'нет'}\n\n"
+                f"{text}"
+            )
             for admin_id in ADMIN_IDS:
                 try:
-                    await bot.send_message(admin_id, text_to_admin)
+                    sent = await bot.send_message(admin_id, text_to_admin)
+                    db.execute("""
+                        INSERT OR REPLACE INTO support_messages
+                        (admin_id, message_id, user_id, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (admin_id, sent.message_id, user_id, now().isoformat()))
+                    db.commit()
                 except Exception as e:
                     print(f"Ошибка отправки админу {admin_id}: {e}")
-            await message.answer("✅ Сообщение отправлено администратору.", reply_markup=settings_keyboard)
+            await message.answer("✅ Сообщение отправлено администратору. Ответ можно отправить Reply на это сообщение.", reply_markup=settings_keyboard)
             return
 
         # Изменение текущего числа
@@ -2277,7 +2320,7 @@ async def main():
         weekly_backup,
         "cron",
         day_of_week="sun",
-        hour=4,
+        hour=21,
         minute=0,
         id="weekly_backup",
         replace_existing=True
@@ -2287,8 +2330,8 @@ async def main():
         weekly_telemetry,
         "cron",
         day_of_week="sun",
-        hour=3,
-        minute=50,
+        hour=21,
+        minute=0,
         id="weekly_telemetry",
         replace_existing=True
     )
