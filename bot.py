@@ -766,35 +766,56 @@ def choose_learning_number(user_id):
     return random.choices(candidates, weights=weights, k=1)[0]
 
 
+def get_today_answer_count(user_id, number):
+    row = db.execute("""
+        SELECT COUNT(*) AS count
+        FROM answer_times
+        WHERE user_id = ?
+          AND number = ?
+          AND created_at >= ?
+    """, (user_id, number, f"{today_str()}T00:00:00")).fetchone()
+    return int(row["count"] or 0)
+
+
+def test_number_score(user_id, number, user_average):
+    """Вес числа для теста с защитой от зацикливания."""
+    score = learning_number_score(user_id, number, user_average)
+    today_answers = get_today_answer_count(user_id, number)
+
+    if today_answers:
+        # Проблемное число всё ещё имеет повышенный вес,
+        # но каждый его повтор в этот день заметно уменьшает вероятность.
+        score *= 0.20 ** min(today_answers, 4)
+
+    return max(0.01, score)
+
+
 def choose_test_numbers(user_id, count):
     user = get_user(user_id)
     if not user:
         return []
 
     current = min(100, user["current_number"])
+    strictness = user["test_strictness"] or DEFAULT_TEST_STRICTNESS
     available = list(range(10, current + 1))
+
+    # В сложном режиме исключаем 10, 20, 30, ..., 100.
+    if strictness == 3:
+        available = [n for n in available if n % 10 != 0]
+
     if not available:
         return []
 
-    must_include = current
-    due = [n for n in get_due_reviews(user_id) if n in available and n != must_include]
-    result = [must_include]
-    result.extend(due[:max(0, count - 1)])
-
+    # Квадрат дня обязателен, кроме круглого десятка в сложном режиме.
+    result = [current] if current in available else []
     candidates = [n for n in available if n not in result]
     user_average = get_user_average_response_time(user_id)
-    weights = [learning_number_score(user_id, n, user_average) for n in candidates]
-    if candidates and len(result) < count:
-        chosen_count = min(count - len(result), len(candidates))
-        # Без повторов в одном тесте.
-        for _ in range(chosen_count):
-            if not candidates:
-                break
-            weights = [learning_number_score(user_id, n, user_average) for n in candidates]
-            selected = random.choices(candidates, weights=weights, k=1)[0]
-            result.append(selected)
-            idx = candidates.index(selected)
-            candidates.pop(idx)
+
+    while candidates and len(result) < count:
+        weights = [test_number_score(user_id, n, user_average) for n in candidates]
+        selected = random.choices(candidates, weights=weights, k=1)[0]
+        result.append(selected)
+        candidates.remove(selected)
 
     random.shuffle(result)
     return result[:min(count, len(available))]
