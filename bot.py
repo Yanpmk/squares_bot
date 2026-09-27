@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # НАСТРОЙКИ
 # ============================================================
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -50,6 +50,9 @@ DEFAULT_TEST_TIME_LIMIT = 15
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 REVIEW_INTERVALS = [1, 2, 4, 7, 14, 30]
+
+# Предвычисляем квадраты один раз при запуске.
+SQUARES = {n: n * n for n in range(10, 101)}
 
 MORNING_PHRASES = [
     "Доброе утро! ☀️ Сегодня в программе — немного математики и один шаг вперёд.",
@@ -148,6 +151,9 @@ def init_db():
             last_morning_phrase INTEGER,
             last_evening_phrase INTEGER,
 
+            blocked INTEGER NOT NULL DEFAULT 0,
+            last_activity_at TEXT,
+
             created_at TEXT NOT NULL
         )
     """)
@@ -162,6 +168,7 @@ def init_db():
             mastered INTEGER NOT NULL DEFAULT 0,
 
             last_seen TEXT,
+            last_learning_at TEXT,
 
             review_stage INTEGER NOT NULL DEFAULT -1,
             next_review TEXT,
@@ -193,10 +200,28 @@ def init_db():
         "test_time_limit": "ALTER TABLE users ADD COLUMN test_time_limit INTEGER NOT NULL DEFAULT 15",
         "last_morning_phrase": "ALTER TABLE users ADD COLUMN last_morning_phrase INTEGER",
         "last_evening_phrase": "ALTER TABLE users ADD COLUMN last_evening_phrase INTEGER",
+        "blocked": "ALTER TABLE users ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0",
+        "last_activity_at": "ALTER TABLE users ADD COLUMN last_activity_at TEXT",
     }
     for column, sql in migrations.items():
         if column not in user_columns:
             db.execute(sql)
+
+    progress_columns = {row["name"] for row in db.execute("PRAGMA table_info(progress)").fetchall()}
+    if "last_learning_at" not in progress_columns:
+        db.execute("ALTER TABLE progress ADD COLUMN last_learning_at TEXT")
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS answer_times (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            number INTEGER NOT NULL,
+            response_seconds REAL NOT NULL,
+            correct INTEGER NOT NULL DEFAULT 0,
+            timed_out INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS tests (
@@ -371,19 +396,59 @@ def create_user(message: Message):
 
 
 def update_user_info(message: Message):
+    previous = db.execute("SELECT blocked FROM users WHERE user_id = ?", (message.from_user.id,)).fetchone()
+    was_blocked = bool(previous and previous["blocked"])
     db.execute("""
         UPDATE users
         SET
             username = ?,
-            first_name = ?
+            first_name = ?,
+            blocked = 0,
+            last_activity_at = ?
         WHERE user_id = ?
     """, (
         message.from_user.username,
         message.from_user.first_name,
+        now().isoformat(),
         message.from_user.id
     ))
-
     db.commit()
+
+    # Если пользователь снова написал боту после блокировки, возвращаем его
+    # в обычное расписание.
+    if was_blocked:
+        schedule_user_day(message.from_user.id)
+
+
+def mark_user_activity(user_id):
+    db.execute("UPDATE users SET last_activity_at = ?, blocked = 0 WHERE user_id = ?", (now().isoformat(), user_id))
+    db.commit()
+
+
+def mark_user_blocked(user_id):
+    db.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
+    db.commit()
+
+
+def is_user_blocked(user_id):
+    row = db.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row["blocked"])
+
+
+async def safe_send_message(user_id, text, **kwargs):
+    if is_user_blocked(user_id):
+        return False
+    try:
+        await bot.send_message(user_id, text, **kwargs)
+        return True
+    except Exception as e:
+        error_text = str(e)
+        if "USER_IS_BLOCKED" in error_text or "bot was blocked" in error_text.lower() or "user is deactivated" in error_text.lower():
+            mark_user_blocked(user_id)
+            print(f"Пользователь {user_id} заблокировал бота или удалён — отключаем исходящие сообщения.")
+        else:
+            print(f"Ошибка отправки пользователю {user_id}: {e}")
+        return False
 
 
 # ============================================================
@@ -592,26 +657,145 @@ def get_learned_numbers(user_id):
     return list(range(10, min(current, 101)))
 
 
+def _days_since(iso_value):
+    if not iso_value:
+        return 999
+    try:
+        dt = datetime.fromisoformat(iso_value)
+        return max(0, (now().date() - dt.date()).days)
+    except (ValueError, TypeError):
+        return 999
+
+
+def get_user_average_response_time(user_id):
+    row = db.execute("""
+        SELECT AVG(response_seconds) AS avg_time
+        FROM answer_times
+        WHERE user_id = ?
+    """, (user_id,)).fetchone()
+    return float(row["avg_time"] or 0.0)
+
+
+def get_number_average_response_time(user_id, number):
+    row = db.execute("""
+        SELECT AVG(response_seconds) AS avg_time, COUNT(*) AS count
+        FROM answer_times
+        WHERE user_id = ? AND number = ?
+    """, (user_id, number)).fetchone()
+    return float(row["avg_time"] or 0.0), int(row["count"] or 0)
+
+
+def learning_number_score(user_id, number, user_average):
+    """Чем выше score, тем вероятнее число попадёт в дневную карточку."""
+    progress = db.execute("""
+        SELECT * FROM progress WHERE user_id = ? AND number = ?
+    """, (user_id, number)).fetchone()
+
+    score = 1.0
+    if not progress:
+        return 35.0
+
+    wrong = progress["wrong"] or 0
+    correct = progress["correct"] or 0
+    last_learning_days = _days_since(progress["last_learning_at"])
+    last_answer_days = _days_since(progress["last_seen"])
+
+    # Ошибки — главный фактор после обязательного квадрата дня.
+    if wrong:
+        score += min(80.0, wrong * 12.0)
+    if progress["next_review"] and progress["next_review"] <= today_str():
+        overdue_days = _days_since(progress["next_review"]) + 1
+        score += 100.0 + min(100.0, overdue_days * 15.0)
+
+    # Давно не видели — постепенно увеличиваем приоритет.
+    if last_learning_days >= 1:
+        score += min(45.0, last_learning_days * 3.0)
+    elif last_answer_days >= 1:
+        score += min(30.0, last_answer_days * 2.0)
+
+    # Новые/редко проверявшиеся числа тоже должны получать шанс.
+    if correct == 0 and wrong == 0:
+        score += 35.0
+
+    # Если число заметно медленнее личного среднего, увеличиваем вероятность.
+    number_avg, samples = get_number_average_response_time(user_id, number)
+    if user_average > 0 and samples >= 2 and number_avg > user_average:
+        ratio = number_avg / user_average
+        score += min(80.0, max(0.0, (ratio - 1.0) * 70.0))
+
+    # Недавно показанное число немного приглушаем, чтобы не зациклиться на нём.
+    if last_learning_days == 0:
+        score *= 0.18
+
+    return max(0.1, score)
+
+
+def choose_learning_number(user_id):
+    """Выбирает число для обычной учебной карточки.
+
+    Квадрат дня обязателен как минимум один раз в день; остальные карточки
+    выбираются по адаптивному весу из уже введённых чисел.
+    """
+    user = get_user(user_id)
+    if not user:
+        return None
+
+    current = min(100, user["current_number"])
+    today = today_str()
+    day_start = user["day_start_number"] or current
+
+    # До завершения обучения доступны все уже введённые числа.
+    if not user["finished"]:
+        candidates = list(range(10, current + 1))
+    else:
+        candidates = list(range(10, 101))
+
+    if not candidates:
+        return current
+
+    # Если сегодня ещё не показывали квадрат дня, он всегда первый.
+    day_progress = db.execute("""
+        SELECT last_learning_at FROM progress
+        WHERE user_id = ? AND number = ?
+    """, (user_id, current)).fetchone()
+    if current in candidates and (not day_progress or not day_progress["last_learning_at"] or _days_since(day_progress["last_learning_at"]) > 0):
+        return current
+
+    user_average = get_user_average_response_time(user_id)
+    weights = [learning_number_score(user_id, n, user_average) for n in candidates]
+    return random.choices(candidates, weights=weights, k=1)[0]
+
+
 def choose_test_numbers(user_id, count):
     user = get_user(user_id)
     if not user:
         return []
 
-    current = user["current_number"]
-    available = list(range(10, min(current, 100) + 1))
+    current = min(100, user["current_number"])
+    available = list(range(10, current + 1))
     if not available:
         return []
 
-    # Квадрат дня обязан присутствовать. При нескольких новых квадратах за день
-    # под "квадратом дня" понимаем последний введённый сегодня номер.
-    must_include = current if current in available else available[-1]
+    must_include = current
     due = [n for n in get_due_reviews(user_id) if n in available and n != must_include]
     result = [must_include]
     result.extend(due[:max(0, count - 1)])
 
     candidates = [n for n in available if n not in result]
-    random.shuffle(candidates)
-    result.extend(candidates[:max(0, count - len(result))])
+    user_average = get_user_average_response_time(user_id)
+    weights = [learning_number_score(user_id, n, user_average) for n in candidates]
+    if candidates and len(result) < count:
+        chosen_count = min(count - len(result), len(candidates))
+        # Без повторов в одном тесте.
+        for _ in range(chosen_count):
+            if not candidates:
+                break
+            weights = [learning_number_score(user_id, n, user_average) for n in candidates]
+            selected = random.choices(candidates, weights=weights, k=1)[0]
+            result.append(selected)
+            idx = candidates.index(selected)
+            candidates.pop(idx)
+
     random.shuffle(result)
     return result[:min(count, len(available))]
 
@@ -690,54 +874,30 @@ def generate_random_times(
 async def send_learning_message(user_id):
     user = get_user(user_id)
 
-    if not user:
+    if not user or is_user_paused(user_id) or user["blocked"]:
         return
 
-    if is_user_paused(user_id):
+    number = choose_learning_number(user_id)
+    if number is None:
         return
 
-    start = user["day_start_number"] if user["day_start_number"] else user["current_number"]
-    end = user["current_number"]
-    today_batch = user["learning_mode"] == 3 and start <= end and user["last_learning_day"] == today_str()
-
-    # В день, когда режим обучения дошёл до 100, сначала ещё выдаём
-    # сегодняшнюю пачку. Со следующего дня начинается постоянное повторение.
-    if user["finished"] and not today_batch:
-        due = get_due_reviews(user_id)
-        if due:
-            number = random.choice(due)
-        else:
-            number = random.randint(10, 100)
-    elif user["learning_mode"] == 3 and start <= end:
-        number = random.randint(start, end)
-    else:
-        number = end
-
-    # Две формы карточек
+    # Фиксируем именно факт показа учебной карточки, отдельно от ответа на тест.
+    value = SQUARES[number]
     if random.choice([True, False]):
-
-        text = (
-            f"📚 Запомни:\n\n"
-            f"{number}² = {number ** 2}"
-        )
-
+        text = f"📚 Запомни:\n\n{number}² = {value}"
     else:
+        text = f"📚 Запомни:\n\n{value} = {number}²"
 
-        text = (
-            f"📚 Запомни:\n\n"
-            f"{number ** 2} = {number}²"
-        )
-
-    try:
-        await bot.send_message(
-            user_id,
-            text
-        )
-    except Exception as e:
-        print(
-            f"Ошибка отправки пользователю "
-            f"{user_id}: {e}"
-        )
+    if await safe_send_message(user_id, text):
+        db.execute("""
+            INSERT OR IGNORE INTO progress (user_id, number)
+            VALUES (?, ?)
+        """, (user_id, number))
+        db.execute("""
+            UPDATE progress SET last_learning_at = ?
+            WHERE user_id = ? AND number = ?
+        """, (now().isoformat(), user_id, number))
+        db.commit()
 
 
 # ============================================================
@@ -758,45 +918,39 @@ def choose_phrase(user_id, kind, phrases):
 async def send_morning_message(user_id):
     user = get_user(user_id)
 
-    if not user or is_user_paused(user_id):
+    if not user or is_user_paused(user_id) or user["blocked"]:
         return
 
     number = user["current_number"]
     start = user["day_start_number"] if user["day_start_number"] else number
     if user["learning_mode"] == 3 and start <= number and (not user["finished"] or user["last_learning_day"] == today_str()):
         nums = list(range(start, number + 1))
-        squares = ", ".join(f"{n}² = {n ** 2}" for n in nums)
+        squares = ", ".join(f"{n}² = {SQUARES[n]}" for n in nums)
         day_text = f"📚 Квадраты дня: {squares}"
     else:
-        day_text = f"📚 Число дня: {number}² = {number ** 2}"
+        day_text = f"📚 Число дня: {number}² = {SQUARES[number]}"
     text = f"{choose_phrase(user_id, 'morning', MORNING_PHRASES)}\n\n{day_text}"
 
-    try:
-        await bot.send_message(user_id, text)
-    except Exception as e:
-        print(f"Ошибка утреннего сообщения для {user_id}: {e}")
+    await safe_send_message(user_id, text)
 
 
 async def send_evening_message(user_id):
     user = get_user(user_id)
 
-    if not user or is_user_paused(user_id):
+    if not user or is_user_paused(user_id) or user["blocked"]:
         return
 
     number = user["current_number"]
     start = user["day_start_number"] if user["day_start_number"] else number
     if user["learning_mode"] == 3 and start <= number and (not user["finished"] or user["last_learning_day"] == today_str()):
         nums = list(range(start, number + 1))
-        squares = ", ".join(f"{n}² = {n ** 2}" for n in nums)
+        squares = ", ".join(f"{n}² = {SQUARES[n]}" for n in nums)
         day_text = f"📚 Квадраты дня: {squares}"
     else:
-        day_text = f"📚 Число дня: {number}² = {number ** 2}"
+        day_text = f"📚 Число дня: {number}² = {SQUARES[number]}"
     text = f"{choose_phrase(user_id, 'evening', EVENING_PHRASES)}\n\n{day_text}"
 
-    try:
-        await bot.send_message(user_id, text)
-    except Exception as e:
-        print(f"Ошибка вечернего сообщения для {user_id}: {e}")
+    await safe_send_message(user_id, text)
 
 
 def remove_user_jobs(user_id):
@@ -815,7 +969,7 @@ def schedule_user_day(user_id, advance=False):
     if not user:
         return
 
-    if is_user_paused(user_id):
+    if is_user_paused(user_id) or user["blocked"]:
         return
 
     # Переход на новый учебный день выполняется только дневным планировщиком.
@@ -944,6 +1098,7 @@ async def cmd_start(message: Message):
 async def today_command(message: Message):
 
     create_user(message)
+    update_user_info(message)
 
     user_id = message.from_user.id
 
@@ -974,7 +1129,7 @@ async def today_command(message: Message):
 
     await message.answer(
         f"📚 Сегодняшнее число:\n\n"
-        f"{number}² = {number ** 2}\n\n"
+        f"{number}² = {SQUARES[number]}\n\n"
         f"Изучается день "
         f"{user['learning_days']} из "
         f"{user['learning_interval']}."
@@ -986,12 +1141,14 @@ async def today_command(message: Message):
 # ============================================================
 
 test_sessions = {}
+test_timeout_tasks = {}
 
 
 @dp.message(F.text == "📝 Пройти тест")
 async def start_test(message: Message):
 
     create_user(message)
+    update_user_info(message)
 
     user_id = message.from_user.id
 
@@ -1017,7 +1174,10 @@ async def start_test(message: Message):
         "current_type": random.randint(1, 2),
         "strictness": user["test_strictness"],
         "time_limit": user["test_time_limit"],
-        "deadline": None
+        "deadline": None,
+        "question_started_at": None,
+        "question_token": None,
+        "answered": False
     }
 
     await send_test_question(
@@ -1026,37 +1186,97 @@ async def start_test(message: Message):
     )
 
 
-async def send_test_question(
-    user_id,
-    message
-):
+async def cancel_test_timeout(user_id):
+    task = test_timeout_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
 
+
+async def timeout_current_question(user_id, question_token):
+    try:
+        session = test_sessions.get(user_id)
+        if not session or session.get("question_token") != question_token or session.get("answered"):
+            return
+        await asyncio.sleep(max(0, (session["deadline"] - now()).total_seconds()))
+        session = test_sessions.get(user_id)
+        if not session or session.get("question_token") != question_token or session.get("answered"):
+            return
+        session["answered"] = True
+        number = session["current_number"]
+        response_seconds = float(session.get("time_limit", DEFAULT_TEST_TIME_LIMIT))
+        record_response_time(user_id, number, response_seconds, correct=False, timed_out=True)
+        register_wrong(user_id, number)
+        await safe_send_message(user_id, f"⏱ Время вышло!\n\nПравильный ответ: {SQUARES[number] if session['current_type'] == 1 else number}")
+        await advance_test_after_answer(user_id)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        print(f"Ошибка таймера теста для {user_id}: {e}")
+
+
+async def send_test_question(user_id, message):
     session = test_sessions[user_id]
-
     number = session["current_number"]
     question_type = session["current_type"]
+    session["answered"] = False
+    session["question_token"] = object()
 
     if question_type == 1:
-
-        text = (
-            f"❓ Вопрос "
-            f"{session['index'] + 1}/"
-            f"{session['questions']}\n\n"
-            f"{number}² = ?"
-        )
-
+        text = f"❓ Вопрос {session['index'] + 1}/{session['questions']}\n\n{number}² = ?"
     else:
+        text = f"❓ Вопрос {session['index'] + 1}/{session['questions']}\n\n{SQUARES[number]} — квадрат какого числа?"
 
-        text = (
-            f"❓ Вопрос "
-            f"{session['index'] + 1}/"
-            f"{session['questions']}\n\n"
-            f"{number ** 2} — квадрат какого числа?"
-        )
-
+    await cancel_test_timeout(user_id)
     await message.answer(text)
+    session["question_started_at"] = now()
+
     if session["strictness"] == 3:
-        session["deadline"] = datetime.now(TIMEZONE) + timedelta(seconds=session.get("time_limit", DEFAULT_TEST_TIME_LIMIT))
+        session["deadline"] = session["question_started_at"] + timedelta(seconds=session.get("time_limit", DEFAULT_TEST_TIME_LIMIT))
+        token = session["question_token"]
+        test_timeout_tasks[user_id] = asyncio.create_task(timeout_current_question(user_id, token))
+    else:
+        session["deadline"] = None
+
+
+def record_response_time(user_id, number, response_seconds, correct, timed_out=False):
+    db.execute("""
+        INSERT INTO answer_times (user_id, number, response_seconds, correct, timed_out, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user_id, number, max(0.0, response_seconds), int(correct), int(timed_out), now().isoformat()))
+    db.commit()
+
+
+async def advance_test_after_answer(user_id):
+    session = test_sessions.get(user_id)
+    if not session:
+        return
+
+    session["index"] += 1
+    if session["index"] >= session["questions"]:
+        score = session["score"]
+        questions = session["questions"]
+        db.execute("""
+            INSERT INTO tests (user_id, test_date, score, questions, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, today_str(), score, questions, now().isoformat()))
+        db.commit()
+        await cancel_test_timeout(user_id)
+        del test_sessions[user_id]
+        percent = round(score / questions * 100)
+        await safe_send_message(user_id, f"🏁 Тест закончен!\n\nРезультат: {score}/{questions}\nТочность: {percent}%\n\nОшибки будут автоматически повторяться по интервальной схеме.", reply_markup=main_keyboard)
+        return
+
+    session["current_number"] = session["numbers"][session["index"]]
+    session["current_type"] = random.randint(1, 2)
+    await send_test_question(user_id, _TestMessageProxy(user_id))
+
+
+class _TestMessageProxy:
+    def __init__(self, user_id):
+        self.user_id = user_id
+
+    async def answer(self, text, **kwargs):
+        await safe_send_message(self.user_id, text, **kwargs)
 
 
 # ============================================================
@@ -1067,158 +1287,103 @@ async def send_test_question(
 async def all_text_handler(message: Message):
 
     create_user(message)
+    update_user_info(message)
 
     user_id = message.from_user.id
-    text = message.text.strip()
-
-    # --------------------------------------------------------
-    # Если сейчас идёт тест
-    # --------------------------------------------------------
+    text = (message.text or "").strip()
 
     if user_id in test_sessions:
+        if text in ["⚙️ Настройки", "📊 Статистика", "📚 Сегодня", "ℹ️ Помощь", "🔢 Изменить число", "⬅️ Назад"]:
+            await message.answer("⚠️ Сначала закончи текущий тест.")
+            return
 
-        if text in [
-            "⚙️ Настройки",
-            "📊 Статистика",
-            "📚 Сегодня",
-            "ℹ️ Помощь",
-            "🔢 Изменить число",
-            "⬅️ Назад"
-        ]:
-            await message.answer(
-                "⚠️ Сначала закончи текущий тест."
-            )
+        session = test_sessions[user_id]
+        if session.get("answered"):
+            return
+
+        # Если таймер уже перевёл тест на следующий вопрос, запоздавший update
+        # от предыдущего вопроса не должен стать ответом на новый.
+        question_started_at = session.get("question_started_at")
+        if question_started_at and message.date:
+            message_time = message.date.astimezone(TIMEZONE)
+            if message_time < question_started_at:
+                return
+
+        # В сложном режиме запоздавший Telegram update тоже считается просроченным,
+        # даже если asyncio-таймер ещё не успел обработать вопрос.
+        if session.get("deadline") and now() >= session["deadline"]:
+            session["answered"] = True
+            number = session["current_number"]
+            record_response_time(user_id, number, session.get("time_limit", DEFAULT_TEST_TIME_LIMIT), False, True)
+            register_wrong(user_id, number)
+            await cancel_test_timeout(user_id)
+            await message.answer(f"⏱ Время вышло!\n\nПравильный ответ: {SQUARES[number] if session['current_type'] == 1 else number}")
+            await advance_test_after_answer(user_id)
             return
 
         try:
             answer = int(text)
         except ValueError:
-
-            await message.answer(
-                "Введите ответ числом."
-            )
+            await message.answer("Введите ответ числом.")
             return
 
-        session = test_sessions[user_id]
-
         number = session["current_number"]
-
-        if session["current_type"] == 1:
-            correct_answer = number ** 2
-        else:
-            correct_answer = number
-
+        correct_answer = SQUARES[number] if session["current_type"] == 1 else number
         strictness = session["strictness"]
-        late = strictness == 3 and session.get("deadline") and datetime.now(TIMEZONE) > session["deadline"]
-        answer_text = str(answer)
-        correct_text = str(correct_answer)
+        started = session.get("question_started_at", now())
+        response_seconds = (now() - started).total_seconds()
 
         def edit_distance_le_one(a, b):
-            if abs(len(a)-len(b)) > 1: return False
-            if len(a) == len(b): return sum(x != y for x,y in zip(a,b)) <= 1
-            if len(a) > len(b): a,b=b,a
-            i=j=diff=0
-            while i<len(a) and j<len(b):
-                if a[i]!=b[j]:
-                    diff += 1; j += 1
-                    if diff > 1: return False
+            if abs(len(a) - len(b)) > 1:
+                return False
+            if len(a) == len(b):
+                return sum(x != y for x, y in zip(a, b)) <= 1
+            if len(a) > len(b):
+                a, b = b, a
+            i = j = diff = 0
+            while i < len(a) and j < len(b):
+                if a[i] != b[j]:
+                    diff += 1
+                    j += 1
+                    if diff > 1:
+                        return False
                 else:
-                    i += 1; j += 1
+                    i += 1
+                j += 1
             return True
 
-        is_correct = (answer == correct_answer) and not late
-        typo = False
-
-        # Лёгкий режим: близкий ответ считается возможной опечаткой, но
-        # сначала предлагаем исправить его. Правильный ответ после исправления
-        # засчитывается как правильный.
+        is_correct = answer == correct_answer
         if session.get("correction_expected"):
+            session["answered"] = True
+            await cancel_test_timeout(user_id)
+            record_response_time(user_id, number, response_seconds, is_correct, False)
             if is_correct:
                 session["score"] += 1
                 register_correct(user_id, number)
-                session.pop("correction_expected", None)
                 await message.answer("✅ Исправлено! Ответ засчитан.")
             else:
                 register_wrong(user_id, number)
-                session.pop("correction_expected", None)
                 await message.answer(f"❌ Неправильно.\nПравильный ответ: {correct_answer}")
-        else:
-            if not is_correct and strictness == 1 and not late:
-                typo = edit_distance_le_one(answer_text, correct_text)
-                if typo:
-                    session["correction_expected"] = True
-                    await message.answer(
-                        f"🟡 Похоже на опечатку: {answer}.\n"
-                        f"Попробуй исправить ответ ещё раз."
-                    )
-                    return
-
-            if is_correct:
-                session["score"] += 1
-                register_correct(user_id, number)
-                await message.answer("✅ Правильно!")
-            else:
-                register_wrong(user_id, number)
-                reason = "⏱ Время вышло.\n" if late else ""
-                await message.answer(reason + f"❌ Неправильно.\nПравильный ответ: {correct_answer}")
-
-        session["index"] += 1
-
-        if session["index"] >= session["questions"]:
-
-            score = session["score"]
-            questions = session["questions"]
-
-            db.execute("""
-                INSERT INTO tests (
-                    user_id,
-                    test_date,
-                    score,
-                    questions,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                user_id,
-                today_str(),
-                score,
-                questions,
-                now().isoformat()
-            ))
-
-            db.commit()
-
-            del test_sessions[user_id]
-
-            percent = round(
-                score / questions * 100
-            )
-
-            await message.answer(
-                f"🏁 Тест закончен!\n\n"
-                f"Результат: {score}/{questions}\n"
-                f"Точность: {percent}%\n\n"
-                f"Ошибки будут автоматически повторяться "
-                f"по интервальной схеме.",
-                reply_markup=main_keyboard
-            )
-
+            session.pop("correction_expected", None)
+            await advance_test_after_answer(user_id)
             return
 
-        session["current_number"] = (
-            session["numbers"][session["index"]]
-        )
+        if not is_correct and strictness == 1 and edit_distance_le_one(str(answer), str(correct_answer)):
+            session["correction_expected"] = True
+            await message.answer(f"🟡 Похоже на опечатку: {answer}.\nПопробуй исправить ответ ещё раз.")
+            return
 
-        session["current_type"] = random.randint(
-            1,
-            2
-        )
-
-        await send_test_question(
-            user_id,
-            message
-        )
-
+        session["answered"] = True
+        await cancel_test_timeout(user_id)
+        record_response_time(user_id, number, response_seconds, is_correct, False)
+        if is_correct:
+            session["score"] += 1
+            register_correct(user_id, number)
+            await message.answer("✅ Правильно!")
+        else:
+            register_wrong(user_id, number)
+            await message.answer(f"❌ Неправильно.\nПравильный ответ: {correct_answer}")
+        await advance_test_after_answer(user_id)
         return
 
     if text.startswith("/broadcast") and user_id in ADMIN_IDS:
@@ -1231,7 +1396,26 @@ async def all_text_handler(message: Message):
         return
 
     if text == "/admin" and user_id in ADMIN_IDS:
-        await message.answer("👑 Админ-команды:\n/broadcast текст — рассылка всем\n/broadcast — затем отдельным сообщением")
+        await message.answer("👑 Админ-команды:\n/broadcast текст — рассылка всем\n/broadcast — затем отдельным сообщением\n/blocked — список пользователей, заблокировавших бота\n/unblock ID — снова разрешить исходящие сообщения")
+        return
+
+    if text == "/blocked" and user_id in ADMIN_IDS:
+        rows = db.execute("SELECT user_id, first_name, username FROM users WHERE blocked = 1 ORDER BY user_id").fetchall()
+        if not rows:
+            await message.answer("🚫 Заблокировавших бота пользователей нет.")
+        else:
+            lines = [f"{r['user_id']} — {r['first_name'] or 'без имени'}" + (f" (@{r['username']})" if r['username'] else "") for r in rows]
+            await message.answer("🚫 Заблокировали бота:\n\n" + "\n".join(lines))
+        return
+
+    if text.startswith("/unblock ") and user_id in ADMIN_IDS:
+        try:
+            target_id = int(text.split(maxsplit=1)[1])
+            db.execute("UPDATE users SET blocked = 0 WHERE user_id = ?", (target_id,))
+            db.commit()
+            await message.answer(f"✅ Пользователь {target_id} снова разрешён для исходящих сообщений.")
+        except ValueError:
+            await message.answer("❌ Формат: /unblock ID")
         return
 
     if user_id in admin_broadcast_sessions and user_id in ADMIN_IDS:
@@ -1567,8 +1751,10 @@ async def all_text_handler(message: Message):
                 return
             text_to_admin = (f"✉️ Сообщение от пользователя\n\n" f"ID: {user_id}\n" f"Имя: {message.from_user.full_name}\n" f"Username: @{message.from_user.username or 'нет'}\n\n" f"{text}")
             for admin_id in ADMIN_IDS:
-                try: await bot.send_message(admin_id, text_to_admin)
-                except Exception as e: print(f"Ошибка отправки админу {admin_id}: {e}")
+                try:
+                    await bot.send_message(admin_id, text_to_admin)
+                except Exception as e:
+                    print(f"Ошибка отправки админу {admin_id}: {e}")
             await message.answer("✅ Сообщение отправлено администратору.", reply_markup=settings_keyboard)
             return
 
@@ -1615,7 +1801,7 @@ async def all_text_handler(message: Message):
 
                 await message.answer(
                     f"✅ Текущее число изменено на {new_number}².\n\n"
-                    f"📚 {new_number}² = {new_number ** 2}\n\n"
+                    f"📚 {new_number}² = {SQUARES[new_number]}\n\n"
                     f"Предыдущие числа сохранены в прогрессе.",
                     reply_markup=settings_keyboard
                 )
@@ -1779,7 +1965,8 @@ async def all_text_handler(message: Message):
             f"{user['current_number']}\n\n"
             f"✅ Правильных ответов: {correct}\n"
             f"❌ Ошибок: {wrong}\n"
-            f"🎯 Общая точность: {accuracy}%\n\n"
+            f"🎯 Общая точность: {accuracy}%\n"
+            f"⏱ Среднее время ответа: {avg_response_text}\n\n"
             f"📝 Тестов пройдено: "
             f"{tests['count'] or 0}"
         )
@@ -1837,6 +2024,7 @@ async def confirm_reset(callback):
     """, (
         user_id,
     ))
+    db.execute("DELETE FROM answer_times WHERE user_id = ?", (user_id,))
 
     db.execute("""
         UPDATE users
@@ -1888,6 +2076,7 @@ async def confirm_clear(callback):
     """, (
         user_id,
     ))
+    db.execute("DELETE FROM answer_times WHERE user_id = ?", (user_id,))
 
     db.execute("""
         UPDATE users
@@ -1913,7 +2102,9 @@ async def confirm_clear(callback):
             test_strictness = ?,
             test_time_limit = ?,
             last_morning_phrase = NULL,
-            last_evening_phrase = NULL
+            last_evening_phrase = NULL,
+            blocked = 0,
+            last_activity_at = ?
         WHERE user_id = ?
     """, (
         DEFAULT_LOWER_HOUR,
@@ -1928,6 +2119,7 @@ async def confirm_clear(callback):
         DEFAULT_TEST_QUESTIONS,
         DEFAULT_TEST_STRICTNESS,
         DEFAULT_TEST_TIME_LIMIT,
+        now().isoformat(),
 
         user_id
     ))
@@ -1969,16 +2161,43 @@ async def cancel_action(callback):
 admin_broadcast_sessions = set()
 
 async def broadcast_to_users(text, admin_id):
-    users = db.execute("SELECT user_id FROM users").fetchall()
+    users = db.execute("SELECT user_id FROM users WHERE blocked = 0").fetchall()
     sent = failed = 0
     for row in users:
         try:
-            await bot.send_message(row["user_id"], f"📢 Сообщение от администратора\n\n{text}")
-            sent += 1
+            if await safe_send_message(row["user_id"], f"📢 Сообщение от администратора\n\n{text}"):
+                sent += 1
         except Exception as e:
             failed += 1
             print(f"Broadcast error {row['user_id']}: {e}")
     await bot.send_message(admin_id, f"📢 Рассылка завершена. Отправлено: {sent}. Ошибок: {failed}.")
+
+async def weekly_telemetry():
+    if not ADMIN_IDS:
+        print("[TELEMETRY] ADMIN_IDS не настроен")
+        return
+    week_ago = (now() - timedelta(days=7)).isoformat()
+    row = db.execute("""
+        SELECT
+            SUM(CASE WHEN blocked = 0 AND last_activity_at IS NOT NULL AND last_activity_at >= ? THEN 1 ELSE 0 END) AS active,
+            SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS new_users,
+            SUM(CASE WHEN blocked = 1 THEN 1 ELSE 0 END) AS blocked_users,
+            COUNT(*) AS total_users
+        FROM users
+    """, (week_ago, week_ago)).fetchone()
+    text = (
+        "📈 Еженедельная телеметрия\n\n"
+        f"👥 Активных за 7 дней: {row['active'] or 0}\n"
+        f"🆕 Новых за 7 дней: {row['new_users'] or 0}\n"
+        f"🚫 Заблокировали бота: {row['blocked_users'] or 0}\n"
+        f"👤 Всего зарегистрировано: {row['total_users'] or 0}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            print(f"Telemetry send error {admin_id}: {e}")
+
 
 async def weekly_backup():
     if not ADMIN_IDS:
@@ -2040,6 +2259,16 @@ async def main():
         hour=4,
         minute=0,
         id="weekly_backup",
+        replace_existing=True
+    )
+
+    scheduler.add_job(
+        weekly_telemetry,
+        "cron",
+        day_of_week="sun",
+        hour=3,
+        minute=50,
+        id="weekly_telemetry",
         replace_existing=True
     )
 
