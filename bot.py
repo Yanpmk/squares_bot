@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # НАСТРОЙКИ
 # ============================================================
 
-VERSION = "0.4.0"
+VERSION = "0.4.2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -220,6 +220,16 @@ def init_db():
             correct INTEGER NOT NULL DEFAULT 0,
             timed_out INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS support_messages (
+            admin_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (admin_id, message_id)
         )
     """)
 
@@ -686,7 +696,7 @@ def get_number_average_response_time(user_id, number):
 
 
 def learning_number_score(user_id, number, user_average):
-    """Чем выше score, тем вероятнее число попадёт в дневную карточку."""
+    """Базовый адаптивный вес числа для теста."""
     progress = db.execute("""
         SELECT * FROM progress WHERE user_id = ? AND number = ?
     """, (user_id, number)).fetchone()
@@ -733,37 +743,54 @@ def learning_number_score(user_id, number, user_average):
 def choose_learning_number(user_id):
     """Выбирает число для обычной учебной карточки.
 
-    Квадрат дня обязателен как минимум один раз в день; остальные карточки
-    выбираются по адаптивному весу из уже введённых чисел.
+    Главный принцип обучения: в течение одного учебного дня обычные
+    карточки закреплены за числом дня и не перескакивают на старые числа.
+
+    Адаптивные веса не используются здесь — они предназначены только
+    для формирования вечернего теста.
     """
     user = get_user(user_id)
     if not user:
         return None
 
     current = min(100, user["current_number"])
-    today = today_str()
-    day_start = user["day_start_number"] or current
 
-    # До завершения обучения доступны все уже введённые числа.
-    if not user["finished"]:
-        candidates = list(range(10, current + 1))
-    else:
-        candidates = list(range(10, 101))
-
-    if not candidates:
+    # Режим 1: одно число в день.
+    # Режим 2: одно число раз в N дней.
+    if user["learning_mode"] != 3:
         return current
 
-    # Если сегодня ещё не показывали квадрат дня, он всегда первый.
-    day_progress = db.execute("""
-        SELECT last_learning_at FROM progress
-        WHERE user_id = ? AND number = ?
-    """, (user_id, current)).fetchone()
-    if current in candidates and (not day_progress or not day_progress["last_learning_at"] or _days_since(day_progress["last_learning_at"]) > 0):
-        return current
+    # Режим 3: N новых чисел в день. Все обычные карточки относятся
+    # только к сегодняшнему набору, а не ко всей истории обучения.
+    start = user["day_start_number"] or current
+    start = max(10, min(start, current))
+    candidates = list(range(start, current + 1))
 
-    user_average = get_user_average_response_time(user_id)
-    weights = [learning_number_score(user_id, n, user_average) for n in candidates]
-    return random.choices(candidates, weights=weights, k=1)[0]
+    return random.choice(candidates) if candidates else current
+
+
+def get_today_answer_count(user_id, number):
+    row = db.execute("""
+        SELECT COUNT(*) AS count
+        FROM answer_times
+        WHERE user_id = ?
+          AND number = ?
+          AND created_at >= ?
+    """, (user_id, number, f"{today_str()}T00:00:00")).fetchone()
+    return int(row["count"] or 0)
+
+
+def test_number_score(user_id, number, user_average):
+    """Вес числа для теста с защитой от зацикливания."""
+    score = learning_number_score(user_id, number, user_average)
+    today_answers = get_today_answer_count(user_id, number)
+
+    if today_answers:
+        # Проблемное число всё ещё имеет повышенный вес,
+        # но каждый его повтор в этот день заметно уменьшает вероятность.
+        score *= 0.20 ** min(today_answers, 4)
+
+    return max(0.01, score)
 
 
 def choose_test_numbers(user_id, count):
@@ -772,29 +799,26 @@ def choose_test_numbers(user_id, count):
         return []
 
     current = min(100, user["current_number"])
+    strictness = user["test_strictness"] or DEFAULT_TEST_STRICTNESS
     available = list(range(10, current + 1))
+
+    # В сложном режиме исключаем 10, 20, 30, ..., 100.
+    if strictness == 3:
+        available = [n for n in available if n % 10 != 0]
+
     if not available:
         return []
 
-    must_include = current
-    due = [n for n in get_due_reviews(user_id) if n in available and n != must_include]
-    result = [must_include]
-    result.extend(due[:max(0, count - 1)])
-
+    # Квадрат дня обязателен, кроме круглого десятка в сложном режиме.
+    result = [current] if current in available else []
     candidates = [n for n in available if n not in result]
     user_average = get_user_average_response_time(user_id)
-    weights = [learning_number_score(user_id, n, user_average) for n in candidates]
-    if candidates and len(result) < count:
-        chosen_count = min(count - len(result), len(candidates))
-        # Без повторов в одном тесте.
-        for _ in range(chosen_count):
-            if not candidates:
-                break
-            weights = [learning_number_score(user_id, n, user_average) for n in candidates]
-            selected = random.choices(candidates, weights=weights, k=1)[0]
-            result.append(selected)
-            idx = candidates.index(selected)
-            candidates.pop(idx)
+
+    while candidates and len(result) < count:
+        weights = [test_number_score(user_id, n, user_average) for n in candidates]
+        selected = random.choices(candidates, weights=weights, k=1)[0]
+        result.append(selected)
+        candidates.remove(selected)
 
     random.shuffle(result)
     return result[:min(count, len(available))]
@@ -1292,6 +1316,27 @@ async def all_text_handler(message: Message):
     user_id = message.from_user.id
     text = (message.text or "").strip()
 
+    if user_id in ADMIN_IDS and message.reply_to_message:
+        support = db.execute("""
+            SELECT user_id FROM support_messages
+            WHERE admin_id = ? AND message_id = ?
+        """, (user_id, message.reply_to_message.message_id)).fetchone()
+
+        if support:
+            if not text:
+                await message.answer("❌ Ответ пустой.")
+                return
+            sent = await safe_send_message(
+                support["user_id"],
+                f"✉️ Ответ администратора:\n\n{text}"
+            )
+            await message.answer(
+                "✅ Ответ отправлен пользователю."
+                if sent else
+                "❌ Не удалось отправить ответ: пользователь заблокировал бота или аккаунт недоступен."
+            )
+            return
+
     if user_id in test_sessions:
         if text in ["⚙️ Настройки", "📊 Статистика", "📚 Сегодня", "ℹ️ Помощь", "🔢 Изменить число", "⬅️ Назад"]:
             await message.answer("⚠️ Сначала закончи текущий тест.")
@@ -1749,13 +1794,25 @@ async def all_text_handler(message: Message):
             if not ADMIN_IDS:
                 await message.answer("❌ Администратор ещё не настроен.", reply_markup=settings_keyboard)
                 return
-            text_to_admin = (f"✉️ Сообщение от пользователя\n\n" f"ID: {user_id}\n" f"Имя: {message.from_user.full_name}\n" f"Username: @{message.from_user.username or 'нет'}\n\n" f"{text}")
+            text_to_admin = (
+                f"✉️ Сообщение от пользователя\n\n"
+                f"ID: {user_id}\n"
+                f"Имя: {message.from_user.full_name}\n"
+                f"Username: @{message.from_user.username or 'нет'}\n\n"
+                f"{text}"
+            )
             for admin_id in ADMIN_IDS:
                 try:
-                    await bot.send_message(admin_id, text_to_admin)
+                    sent = await bot.send_message(admin_id, text_to_admin)
+                    db.execute("""
+                        INSERT OR REPLACE INTO support_messages
+                        (admin_id, message_id, user_id, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (admin_id, sent.message_id, user_id, now().isoformat()))
+                    db.commit()
                 except Exception as e:
                     print(f"Ошибка отправки админу {admin_id}: {e}")
-            await message.answer("✅ Сообщение отправлено администратору.", reply_markup=settings_keyboard)
+            await message.answer("✅ Сообщение отправлено администратору. Ответ можно отправить Reply на это сообщение.", reply_markup=settings_keyboard)
             return
 
         # Изменение текущего числа
@@ -2256,7 +2313,7 @@ async def main():
         weekly_backup,
         "cron",
         day_of_week="sun",
-        hour=4,
+        hour=21,
         minute=0,
         id="weekly_backup",
         replace_existing=True
@@ -2266,8 +2323,8 @@ async def main():
         weekly_telemetry,
         "cron",
         day_of_week="sun",
-        hour=3,
-        minute=50,
+        hour=21,
+        minute=0,
         id="weekly_telemetry",
         replace_existing=True
     )
