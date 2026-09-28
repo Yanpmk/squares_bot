@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # НАСТРОЙКИ
 # ============================================================
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -696,7 +696,7 @@ def get_number_average_response_time(user_id, number):
 
 
 def learning_number_score(user_id, number, user_average):
-    """Чем выше score, тем вероятнее число попадёт в дневную карточку."""
+    """Базовый адаптивный вес числа для теста."""
     progress = db.execute("""
         SELECT * FROM progress WHERE user_id = ? AND number = ?
     """, (user_id, number)).fetchone()
@@ -743,37 +743,30 @@ def learning_number_score(user_id, number, user_average):
 def choose_learning_number(user_id):
     """Выбирает число для обычной учебной карточки.
 
-    Квадрат дня обязателен как минимум один раз в день; остальные карточки
-    выбираются по адаптивному весу из уже введённых чисел.
+    Главный принцип обучения: в течение одного учебного дня обычные
+    карточки закреплены за числом дня и не перескакивают на старые числа.
+
+    Адаптивные веса не используются здесь — они предназначены только
+    для формирования вечернего теста.
     """
     user = get_user(user_id)
     if not user:
         return None
 
     current = min(100, user["current_number"])
-    today = today_str()
-    day_start = user["day_start_number"] or current
 
-    # До завершения обучения доступны все уже введённые числа.
-    if not user["finished"]:
-        candidates = list(range(10, current + 1))
-    else:
-        candidates = list(range(10, 101))
-
-    if not candidates:
+    # Режим 1: одно число в день.
+    # Режим 2: одно число раз в N дней.
+    if user["learning_mode"] != 3:
         return current
 
-    # Если сегодня ещё не показывали квадрат дня, он всегда первый.
-    day_progress = db.execute("""
-        SELECT last_learning_at FROM progress
-        WHERE user_id = ? AND number = ?
-    """, (user_id, current)).fetchone()
-    if current in candidates and (not day_progress or not day_progress["last_learning_at"] or _days_since(day_progress["last_learning_at"]) > 0):
-        return current
+    # Режим 3: N новых чисел в день. Все обычные карточки относятся
+    # только к сегодняшнему набору, а не ко всей истории обучения.
+    start = user["day_start_number"] or current
+    start = max(10, min(start, current))
+    candidates = list(range(start, current + 1))
 
-    user_average = get_user_average_response_time(user_id)
-    weights = [learning_number_score(user_id, n, user_average) for n in candidates]
-    return random.choices(candidates, weights=weights, k=1)[0]
+    return random.choice(candidates) if candidates else current
 
 
 def get_today_answer_count(user_id, number):
